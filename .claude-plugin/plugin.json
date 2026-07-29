@@ -1,0 +1,9 @@
+{
+  "name": "river",
+  "description": "Agent skills for the River API — write correct training scripts with the river-client Python package: LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models.",
+  "version": "0.1.0",
+  "author": {
+    "name": "River",
+    "url": "https://river.ai"
+  }
+}
