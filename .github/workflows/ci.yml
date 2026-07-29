@@ -1,0 +1,29 @@
+name: CI
+
+# Validates every skill and the plugin manifests: SKILL.md frontmatter is
+# well-formed and matches its directory, marketplace.json/plugin.json are
+# valid and consistent, and README.md lists every skill.
+# Runs on the sync commits pushed from the monorepo too, so a bad mirror
+# lands red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate skills and manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Validate
+        run: python3 scripts/validate_skills.py
