@@ -5,6 +5,7 @@ Checks:
 - every entry in skills/ is a directory containing a SKILL.md
 - SKILL.md has YAML frontmatter with `name` matching its directory and a
   non-empty `description`, within Claude Code's limits (64 / 1024 chars)
+- every Python code fence in SKILL.md is syntactically valid
 - .claude-plugin/marketplace.json and plugin.json are valid and consistent
 - every skill is listed in README.md
 
@@ -12,9 +13,11 @@ Run from anywhere: `python3 scripts/validate_skills.py`. Exits non-zero on
 the first report of any error. Requires PyYAML.
 """
 
+import ast
 import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import yaml
@@ -23,6 +26,10 @@ ROOT = Path(__file__).resolve().parent.parent
 NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 MAX_NAME = 64
 MAX_DESCRIPTION = 1024
+PYTHON_FENCE_RE = re.compile(
+    r"^```python[ \t]*\n(?P<source>.*?)^```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
 
 errors: list[str] = []
 
@@ -56,6 +63,18 @@ def parse_frontmatter(path: Path) -> tuple[dict | None, str]:
     return data, body
 
 
+def check_python_fences(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    for match in PYTHON_FENCE_RE.finditer(text):
+        source = textwrap.dedent(match.group("source"))
+        first_source_line = text.count("\n", 0, match.start("source")) + 1
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:
+            line = first_source_line + (exc.lineno or 1) - 1
+            err(f"{rel(path)}:{line}: invalid Python example: {exc.msg}")
+
+
 def check_skill(skill_dir: Path) -> None:
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.is_file():
@@ -87,6 +106,8 @@ def check_skill(skill_dir: Path) -> None:
 
     if not body:
         err(f"{rel(skill_md)}: body is empty")
+
+    check_python_fences(skill_md)
 
 
 def load_json(path: Path) -> dict | None:

@@ -1,8 +1,9 @@
 name: CI
 
 # Validates every skill and the plugin manifests: SKILL.md frontmatter is
-# well-formed and matches its directory, marketplace.json/plugin.json are
-# valid and consistent, and README.md lists every skill.
+# well-formed and matches its directory, fenced Python examples compile,
+# marketplace.json/plugin.json are valid and consistent, and README.md lists
+# every skill.
 # Runs on the sync commits pushed from the monorepo too, so a bad mirror
 # lands red.
 
@@ -25,5 +26,5 @@ jobs:
       - name: Install PyYAML
         run: python3 -m pip install --quiet pyyaml
 
-      - name: Validate
+      - name: Validate skills, manifests, and Python examples
         run: python3 scripts/validate_skills.py

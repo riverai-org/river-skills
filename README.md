@@ -35,7 +35,7 @@ Or vendor it into a project at `.claude/skills/river-client-training/`.
 
 The canonical copy of each skill ships inside the `river-client` Python package (`river_client/skills/`), so scripts that install the package get it automatically. This repo republishes the skills for direct agent installation; skill files here are kept byte-identical to the packaged versions.
 
-CI validates every skill's frontmatter, the plugin manifests, and the README skill listing on each push — run it locally with `python3 scripts/validate_skills.py` (needs PyYAML).
+CI validates every skill's frontmatter and Python examples, the plugin manifests, and the README skill listing on each push — run it locally with `python3 scripts/validate_skills.py` (needs PyYAML).
 
 ## Links
 
