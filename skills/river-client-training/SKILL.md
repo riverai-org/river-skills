@@ -1,6 +1,6 @@
 ---
 name: river-client-training
-description: Write training scripts with the river-client Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Use when writing or reviewing code that imports river_client, builds training data for forward_backward / train_step, samples from training weights, or wires up a training loop. Centers on the current train_step API and its pipelining/error semantics; also covers multimodal (image) data, session tags, sampling and prompt logprobs and their uses, MoE expert-routing capture and replay, teacher→student distillation with two models, and fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors.
+description: Write training scripts with the river-client Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Use when writing or reviewing code that imports river_client, builds training data for forward_backward / train_step, samples from training weights, or wires up a training loop. Centers on the current train_step API and its pipelining/error semantics; also covers multimodal data, image uploads and handles with expiry/recovery, session tags, sampling and prompt logprobs and their uses, MoE expert-routing capture and replay, teacher→student distillation with two models, fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors, and dedicated streaming-inference deployments that serve a checkpoint behind an OpenAI-compatible URL.
 ---
 
 # Train with river_client (the current API)
@@ -56,19 +56,80 @@ so keep them short labels, not payloads.
 `LoraConfig` knobs: `rank` (max 32), `train_attn` / `train_mlp` (both default
 on), `train_unembed` (default off), `seed` (reproducible adapter init).
 
-**Why `train_unembed=True` for RL.** The unembedding (`lm_head`) is the final
-hidden-state → vocab-logits matrix; this flag adds a LoRA adapter on it. With
-the head frozen, a policy update can only change token probabilities
-indirectly, by bending hidden states through the trunk adapters. The RL losses
-(`importance_sampling` / `ppo` / `cispo`) are exactly "push probability toward
-or away from these sampled tokens, weighted by advantage" — a gradient that
-lands first on the logits — and RL's signal is one scalar reward per sequence,
-so you want it expressible as directly as possible. A head adapter gives that
-direct lever (suppress premature EOS, boost format tokens, sharpen the
-distribution) without spending trunk capacity — and without it, updates burn
-more KL (`kl`, `mean_ratio` drift) for less reward gain. For SFT the dense
-per-token cross-entropy signal usually makes trunk adapters sufficient, which
-is why the flag defaults off; turn it on for RL loops.
+`train_unembed=True` adds a LoRA adapter to the output head (`lm_head`), so
+policy updates can change logits through the head as well as the trunk. Enable
+it only for models that support head LoRA. **GLM-5.3 Flash currently requires
+`train_unembed=False`**; keep the default for that model, including RL. Recreate
+the same LoRA configuration when restoring a checkpoint.
+
+## Multi-turn RL: use river_client.rl
+
+For a complete script with a per-trajectory tool environment, renderer selection,
+training, checkpoint resume and evaluation, read [the multi-turn example](references/multi-turn-rl.md).
+It also covers screenshot observations, synchronous overlap and bounded KV reuse.
+
+For a new multi-turn RL loop, compose `rl.RolloutEngine` and `rl.AsyncTrainer`.
+The wrapper owns exact sampled ids, causal prediction masks, segment continuation,
+group completion and per-span staleness. Use `Env.reset`, `Env.reward`, async
+`@tool` functions, and optional `Env.on_turn` returning only new environment
+messages. Pass an environment factory for one sandbox per trajectory. Supply a
+renderer selected by `get_renderer(model_name, tokenizer=...)` for the model's
+exact append-only framing, tools and image format; GLM-5.3 Flash is supported. Multiple
+stop strings are supported. Keep elapsed-time limits out of reward/truncation
+policies. Optional environment watchdogs fail with `InfrastructureError`; provider
+outages must propagate, not become tool observations. `max_images=None` leaves
+image count to task context budgets and server validation.
+
+```python
+from river_client import rl
+
+trainer = rl.AsyncTrainer(
+    engine=rl.RolloutEngine(model, env=TaskEnv, renderer=renderer),
+    optimizer=rl.Adam(lr=6e-5),
+    completion=rl.GroupCompletion(mode="wait"),
+    normalize="token", groups_per_step=48, group_size=16,
+    advantage=rl.GroupCentered(), loss="cispo", max_staleness=2,
+)
+async for step in trainer.run(dataset, steps=500):
+    log(step.metrics)
+```
+
+`normalize` is mandatory: token averages retained generated positions; sequence
+averages each trajectory then trajectories; batch divides the summed token loss
+by trajectory count. `max_staleness=0` restricts admission to the current batch.
+Group-centered, trajectory-pinned sampling with wait semantics automatically
+overlaps ready groups' forward/backward work with unfinished rollouts; async
+policy staleness is not required. `forward_backward_batch` controls aggregation.
+Zero-gradient batches advance `Step.n` but do not advance `Step.model_step`.
+For custom algorithms, consume `engine.rollout(rows, group_size=...,
+completion=...)` and use `traj.to_data(advantage)` directly.
+
+Do not decode and re-render sampled spans. Messages are only a tool/reward view.
+Use `traj.rewrite(messages, chunks=...)` for deliberate compaction; it creates a
+new conditioning run and training datum. The wrapper rejects reconstructed ids
+or padded logprobs via `Sample.token_data_is_exact`. Image expansion is checked
+against echoed prompt positions. `Sample.model_step` remains a client-observed
+step; it does not certify the server's weight version.
+
+Deadline carry-over requires `Batchwise` advantages. Truncation policies distinguish
+zero reward, dropping while retaining a baseline contribution, and excluding both.
+`decoupled_ppo` preserves the behavior correction as well as proximal logprobs;
+use `stale_policy="keep"` explicitly if old spans should remain trainable.
+
+`Checkpointing(run_dir=...)` needs durable POSIX storage for metadata. It saves
+River training weights separately and journals intervening optimizer inputs for
+replay. Resume requires unchanged rows, batching, horizon and configuration;
+include custom environment/reward changes in `run_config`. `init_checkpoint`
+is weights-only and conflicts with an existing run snapshot. Unknown environment
+recovery regenerates unfinished members and reports their count. `Evaluator`
+requires a `CheckpointSampler` on separate capacity; `WandbSink` logs measured
+step through its own axis. Evaluation rollout engines may use `temperature=0`
+for greedy decoding; the training engine requires a positive temperature.
+Evaluation failures preserve completed updates in the checkpoint journal before
+stopping the trainer. These paths do not provision a sandbox fleet.
+
+The wrapper waits for successful backward before submitting Adam. The primitive
+`train_step` below remains useful when its pipelined failure semantics are desired.
 
 ## train_step — the default way to take a step
 
@@ -80,7 +141,7 @@ pipelines them without a client round trip in between:
 fb_result, optim_result = model.train_step(
     data,                      # list[dict] — see data format below
     lr=1e-4,
-    loss_fn="cross_entropy",   # or importance_sampling / ppo / cispo
+    loss_fn="cross_entropy",   # or importance_sampling / ppo / cispo / echo_cispo / dro
     grad_clip_norm=1.0,        # optional; also beta1/beta2/eps/weight_decay
 )
 print(fb_result.metrics["loss_mean"], optim_result.metrics.get("grad_norm"))
@@ -148,10 +209,29 @@ which tokenize, apply the chat template, and mask non-trainable positions
 ```python
 from river_client.renderers import get_renderer, TrainOnWhat
 
-renderer = get_renderer("Qwen/Qwen3.6-35B-A3B-FP8")   # Qwen3.5/3.6 + Kimi K2.x
+renderer = get_renderer("Qwen/Qwen3.6-35B-A3B-FP8")   # family from the model name
 example = renderer.build_training_example(messages, train_on=TrainOnWhat.LAST_ASSISTANT)
 datum = example.to_dict()                              # ready for train_step
 ```
+
+`get_renderer` detects the family from the model name — Qwen3.5/3.6/3.8, Kimi
+K2.5/K2.6, Kimi K3, GLM-5.2, GLM-5.3 Flash, DeepSeek V4 and Nemotron 3.5
+Lightning — and raises on anything else. Thinking defaults on; disabling it
+with `thinking=False` depends on the model template. GLM-5.3 Flash always
+opens a thinking block. `reasoning_effort` is supported by Qwen3.8
+(`xhigh`/`medium`/`low`), GLM-5.2 (`max`/`high`), and GLM-5.3 Flash and Kimi K3
+(`max`/`high`/`low`); passing it to another family raises rather than silently
+doing nothing. Effort controls prompting, not the generated-token budget.
+
+Kimi K3 is the family whose wire format changes how you handle samples. It
+renders XTML elements rather than K2's format, so supply a K3 tokenizer
+matching your endpoint. Decode with `skip_special_tokens=False` before
+`renderer.parse_response(...)` — text that has already dropped the XTML markers
+cannot be parsed — and judge completion from the sample's stop reason, since
+`stop_found` only reports an EOS token still present in the decoded text and
+serving can remove it. K3 covers text, structured reasoning, typed tool calls
+and SFT examples with inference-aligned masks; image content raises
+`ValueError`.
 
 `to_dict()` has two defaults worth knowing. `normalize_weights=True` rescales
 each example's weights to sum to 1.0 — per-example token-mean, so batch loss
@@ -163,15 +243,12 @@ leave it on, or every completion token's signal lands one position late.
 
 ## Images (multimodal)
 
-Served model families are vision-capable (every Qwen3.5/3.6 checkpoint is a
-vision-language model; Kimi K2.x likewise). Images are raw PNG or JPEG bytes —
-the format is inferred from the bytes' magic header. Let the renderer do the
-placeholder bookkeeping: each image needs exactly one un-expanded placeholder
-token. The renderer and `model_input` paths validate this client-side and
-raise a precise `ValueError` naming the counts; only the raw
-`prompt_token_ids=` + `images=` path can carry a mismatch to the backend,
-where surplus images are silently dropped and surplus placeholders fail deep
-in the engine.
+Use a vision-capable model supported by your endpoint; not every model supports
+images. Images can be raw PNG or JPEG bytes, with the format inferred from the
+bytes, or reusable uploaded handles (see below). Use the renderer or `model_input`
+to pair each image with its placeholder: both validate the counts and raise
+`ValueError` on a mismatch. With raw `prompt_token_ids=` + `images=`, you must
+ensure that pairing yourself.
 
 Build messages with `image_part` mixed into the content list. Passing
 `height`/`width` explicitly keeps the client Pillow-free (otherwise PIL is
@@ -204,11 +281,197 @@ Notes:
 
 - `SamplePrompt.to_kwargs()` emits `prompt` (singular). To batch several
   multimodal prompts in one `sample` call, pass `prompts=[...]` plus
-  per-prompt images as `images=list[list[bytes]]` (a flat `list[bytes]`
-  broadcasts the same images to every prompt).
-- `model.sample(model_input=...)` also accepts the training-style chunk list
-  (`[{"type": "text", "tokens": [...]}, {"type": "image", "data": ...}, ...]`)
-  for exact prompt-token control in RL-style multimodal loops.
+  per-prompt image lists as `images=[[image_a], [image_b]]`. A flat image
+  list broadcasts the same images to every prompt. Lists can mix bytes and
+  `ImageHandle` objects; their order is preserved.
+- `model.sample(model_input=...)` also accepts a renderer-generated training
+  chunk list for exact prompt-token control in RL-style multimodal loops.
+
+### Upload once and reuse a handle
+
+`session.upload_image` returns an `ImageHandle` with image dimensions, so
+`image_part(handle)` needs no additional height or width. Handles work with
+`model.sample`, `session.sample` (from a checkpoint), `client.sample`, and
+chunked `model.forward` / `model.forward_backward` input. Use `image_part(handle)`
+in messages or `images=[handle]` in sampling. For training, put `image_part(handle)`
+in the messages passed to `renderer.build_training_example(...).to_dict()`, as
+in the training example above. The renderer supplies the required positive
+`expected_tokens` count and aligned training weights. If replacing inline bytes
+in an existing training image chunk with a handle for the same image, change
+only its `data` field; preserve `expected_tokens` and the other fields. A bare
+`{"type": "image", "data": handle}` is not a valid training chunk.
+
+```python
+import os
+from pathlib import Path
+from uuid import uuid4
+
+import river_client as river
+from river_client.renderers import get_renderer, image_part
+
+base_model = "Qwen/Qwen3.5-9B"  # Requires a vision-capable model on your endpoint.
+client = river.Client(api_key=os.environ["RIVER_API_KEY"])
+renderer = get_renderer(base_model)
+original_bytes = Path("screenshot.png").read_bytes()
+upload_key = str(uuid4())  # Keep this and the bytes if recovery is needed.
+
+try:
+    with client.session() as session:
+        image = session.upload_image(original_bytes, idempotency_key=upload_key)
+        prompt = renderer.build_sample_prompt([
+            {"role": "user", "content": [
+                image_part(image),
+                {"type": "text", "text": "Describe this screenshot."},
+            ]},
+        ])
+        samples = client.sample(
+            prompts=prompt.prompt, images=prompt.images,
+            base_model=base_model, max_tokens=128,
+        )
+        # Reuse image in later messages or training data while the session is open.
+finally:
+    client.close()
+```
+
+### Async uploads, concurrency, and retries
+
+```python
+image = await session.upload_image_async(
+    screenshot_bytes, idempotency_key=upload_key,  # UUID string
+)
+# Release early once no future request needs the image:
+await session.release_image_async(image)
+# Alternatively, clean up an upload whose response was lost:
+await session.release_image_async(idempotency_key=upload_key)
+```
+
+`session.upload_image` and `session.release_image` are the synchronous equivalents.
+Each upload call accepts one image. For multiple images, await uploads concurrently
+(e.g. with `asyncio.gather`); there is no batch-upload RPC. Async uploads and
+releases share a per-client limit of **4 concurrent operations** by default;
+configure it with `river.Client(image_upload_concurrency=...)`. Use the same event
+loop for all async image operations on a client. `await client.aclose()` waits
+for started uploads without blocking the event loop.
+
+A UUID idempotency key identifies immutable content within its uploading session.
+The same key and bytes return the same handle; different bytes under that key
+fail. If omitted, the SDK generates a key and retains it across transport retries.
+Persist an explicit key to recover after cancellation or a lost response.
+Cancelling a coroutine stops waiting but does not cancel an upload that has
+already started; it continues to count against concurrency until completion.
+Retry with the original key and bytes to recover its handle.
+
+Release is idempotent. Release by key also prevents a delayed upload with that
+key from recreating the image. An explicitly released key cannot be reused;
+new content requires a new key.
+
+### Image lifetime and recovery
+
+Handles belong to the authenticated user, deployment, and uploading session.
+Keep that session active while using them; closing it releases its images, and
+handles cannot be used after session loss or by another user.
+
+Images expire after **six hours without an accepted request referencing them**.
+Submitting sampling, forward, or forward/backward work refreshes all referenced
+images for another six hours, provided all references are valid. Session
+heartbeats alone do not refresh them. There is no client TTL control or renewal
+RPC. An accepted request remains valid even if its images expire or are released
+while it is queued or executing; later requests must still use valid handles.
+
+An expired reference rejects the entire submission before it is queued. The SDK
+raises `river.RiverConnectionError` with `status_code="FAILED_PRECONDITION"`,
+`error_code="IMAGE_EXPIRED"`, and `image_id` identifying an expired image. Other
+images in that rejected request are not refreshed. In the same active session,
+re-upload identical bytes using the original idempotency key to restore the
+**same handle ID**, then resubmit. Explicit release is permanent and cannot be
+reversed this way.
+
+For the single-image prompt above, while its session is still active:
+
+```python
+try:
+    samples = client.sample(
+        prompts=prompt.prompt, images=prompt.images, base_model=base_model,
+    )
+except river.RiverConnectionError as error:
+    if error.error_code != "IMAGE_EXPIRED" or error.image_id != image.id:
+        raise
+    session.upload_image(original_bytes, idempotency_key=upload_key)
+    samples = client.sample(
+        prompts=prompt.prompt, images=prompt.images, base_model=base_model,
+    )
+```
+
+For multiple images, keep a mapping from handle IDs to original bytes and upload
+keys, and restore each expired reference before retrying. Reusing or restoring
+an image handle does not guarantee a KV-cache hit.
+
+To resume in a **new session**, keep original bytes in your own durable storage,
+re-upload them, and replace the old handles in saved messages or training data.
+Handle metadata alone cannot recover the bytes. Use the checkpoint image store described below to persist these bytes.
+
+### Storage limits and compatibility
+
+Default upload quotas are **64 GiB and 100,000 images per authenticated user**,
+shared across all sessions and API keys, with no separate session quota.
+Pending uploads and images awaiting cleanup can still count toward usage;
+releasing an image may not free capacity immediately. Once cleanup finishes,
+expired or released images no longer consume quota. Historical upload keys do
+not accumulate a lifetime quota charge. Restoring an expired image needs available
+capacity, just like a new upload.
+
+Quota rejection raises `river.RiverConnectionError` with
+`status_code="RESOURCE_EXHAUSTED"` and `error_code="IMAGE_QUOTA_EXCEEDED"`.
+Release unused images and retry when capacity is available. Releases and session
+closure still work at quota. Upload concurrency does not increase storage quotas;
+normal per-image, request, training datum, image-count, and context limits still
+apply to handles.
+
+Older endpoints return `UNIMPLEMENTED` for image uploads. The client does not
+silently fall back to inline images. Inline bytes remain supported independently
+of handles. The RL wrapper checks `session_image_handles_v1` during preflight.
+
+### RL checkpoints and resume
+
+
+Uploads keep a temporary local copy until `Client.close()`. Persist image bytes
+in the checkpoint store for recovery after process exit.
+When `rl.AsyncTrainer` saves a checkpoint, it copies every referenced image into
+`<run_dir>/images/<sha256>` before atomically committing `trainer.json`. This
+includes dataset references, pending trajectories, environment snapshots, and
+optimizer replay data. Repeated content is stored once. Images no longer referenced
+by the latest committed state are pruned after that commit succeeds.
+
+Keep the entire checkpoint directory on durable local/shared storage. Backing up
+only `trainer.json` is insufficient. When resuming with a new session, the trainer
+verifies the bytes, re-uploads them with deterministic per-session keys, and
+rewrites every saved handle before replaying updates or recovering rollouts.
+Fingerprints identify image content and dimensions, so new handle IDs do not
+change the training recipe. Missing or corrupt image bytes fail recovery explicitly.
+
+Custom checkpoint users can use `river.ImageStore(directory)` to store bytes with
+`put(data)`, and `await session.restore_images(decoded_state, image_store=store)`
+to re-upload and remap handles in dict/list state. Store both the serialized state
+and all referenced bytes before ending the original session. Handle metadata alone
+cannot recover the image. The standard RL trainer manages this automatically.
+
+### RL image limits and sampling batches
+
+There is no extra 16-image limit in the RL wrapper: `Budget.max_images=None` by
+default. Model and API limits still apply. An `Env.reset` or `Env.on_turn`
+implementation can await `session.upload_image_async` while other trajectories
+continue sampling.
+
+`Schedule.max_batch` and `Schedule.max_batch_bytes` (256 MiB by default) limit
+sampling submission batches. The byte estimate includes image sizes even when
+using handles, so a small handle does not bypass the target. A single prompt
+above the byte target is submitted alone and remains subject to API limits.
+These settings affect transport batching, not group membership, advantages, or
+rollout admission, and can change on resume. The sampling metric
+`peak_batch_bytes_estimate` reports the largest submitted estimate.
+
+Multimodal RL requires `prompt_token_echo_v1` to align sampled tokens with training
+data. Ensure your endpoint advertises it before starting an image rollout.
 
 ## Example 1 — minimal SFT loop
 
@@ -599,11 +862,32 @@ size and sequence length, so use lower LRs than with mean-reduced losses:
 | `importance_sampling` | on-policy single-epoch RL (GRPO-style), unclipped | — | `4e-5` |
 | `ppo` | multi-epoch on the same batch, two-sided clip | `clip_low`, `clip_high` | `1e-5`–`4e-5` |
 | `cispo` | stale/off-policy samples, upper-only stop-gradient clip | `eps_max` (default 6.0) | `1e-5`–`4e-5` |
+| `echo_cispo` | CISPO plus next-token prediction on environment/tool observations | `eps_max`, `echo_coef` (default 0.05) | `1e-5`–`4e-5` |
+| `dro` | policy gradient plus a quadratic behavior-policy anchor | `beta` (default 0.05) | `1e-5`–`4e-5` |
+
+`echo_cispo` takes the usual CISPO fields plus a non-negative, per-token
+`echo_weights` array in each datum. `advantages` selects assistant action
+positions for the clipped policy objective; `echo_weights` selects observation
+positions for ordinary cross-entropy. Observation tokens do not receive an
+importance ratio or policy advantage. Keep the masks disjoint; the
+`echo_policy_overlap_count` metric reports accidentally double-supervised
+positions. Arrays are prediction-position aligned:
+`echo_weights[i]` weights `target_tokens[i]` (or `input_ids[i + 1]` when River
+creates the default causal targets). For ECHO-style per-trajectory
+normalization, set each selected observation position to
+`1 / observation_token_count`. Pass `echo_weights` only to
+`forward_backward`/`train_step`; `optim_step` needs no additional argument.
+When `logprob_temperature != 1`, CISPO uses the tempered rollout policy while
+ECHO still trains the raw model distribution, so the implementation evaluates
+both cross-entropies per chunk.
 
 RL metrics come back on `ForwardResult.metrics`: raw sums plus derived
 `mean_ratio`, `kl`, `entropy` (and `clip_frac` / `truncation_frac` for
-ppo/cispo). `cross_entropy` returns `loss`, `loss_sum`, `loss_mean`,
-`num_tokens`, `weight_sum`.
+ppo/cispo/echo_cispo). `cross_entropy` returns `loss`, `loss_sum`, `loss_mean`,
+`num_tokens`, `weight_sum`. `echo_cispo` additionally returns `echo_loss`,
+`echo_penalty`, `echo_loss_sum`, `echo_penalty_sum`, `echo_weight_sum`,
+`num_echo_tokens`, and `echo_policy_overlap_count`. The two derived metrics
+(`echo_loss` and `echo_penalty`) are omitted when `echo_weight_sum` is zero.
 
 ## Checkpointing
 
@@ -615,6 +899,95 @@ sampler_ckpt = model.save_weights("for_infer", mode="inference")   # PEFT, no op
 
 `session.create_model(..., checkpoint=ckpt)` restores step and optimizer state
 automatically when given a `Checkpoint` object.
+
+When using `river_client.rl` checkpointing, journal recovery reuses the recorded
+sequences, behavior logprobs, advantages and optimizer parameters, but recomputes
+MoE routing on the trainer. Original sampler routing captures are not required
+for restore; recovered updates may differ from the original updates. Saved
+trajectories also use trainer routing until another sampling turn provides a
+fresh full-prefix capture. Fresh training uses the configured routing replay.
+
+## Dedicated streaming inference — serving a checkpoint
+
+**Gated feature — disabled by default.** Contact River to enable dedicated
+deployments for the team and the checkpoint's base model before writing code
+against these APIs. Use a team API key with that access; personal API keys
+cannot create deployments. Installing or upgrading `river-client` does not
+enable access. Creation and capacity increases (including resuming from zero)
+require an active team/model grant. Existing deployments can still be scaled
+down or deleted after that grant is revoked.
+
+Create capacity with the River client, then use the standard OpenAI client
+(install `openai` alongside `river-client`).
+
+```python
+from openai import OpenAI
+
+deployment = client.create_deployment(
+    checkpoint=checkpoint,
+    prefill_replicas=2,
+    decode_replicas=2,
+    wait=True,
+)
+# Alternatively: client.create_deployment(checkpoint, unified_replicas=2, wait=True)
+
+inference = OpenAI(api_key="your-river-key", base_url=deployment.base_url, max_retries=8)
+# Existing inference code and its model argument can stay unchanged.
+with inference.chat.completions.create(
+    model="your-existing-model",
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True,
+) as stream:
+    for chunk in stream:
+        if chunk.choices:
+            print(chunk.choices[0].delta.content or "", end="", flush=True)
+
+with inference.responses.create(
+    model="your-existing-model", input="Hello", store=False, stream=True,
+) as stream:
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+        elif event.type in ("response.completed", "response.incomplete", "response.failed"):
+            final_response = event.response
+
+active_deployments = client.list_deployments()
+usage = client.get_deployment_usage(deployment.id)
+
+client.scale_on_target(deployment.id, decode_replicas=3)
+client.delete_deployment(deployment.id, wait=True)
+```
+
+The returned URL selects the checkpoint; it cannot be overridden by the
+request's model. Provisioning and scaling are asynchronous. The backend chooses
+the hardware and preloads one adapter per engine. Scale both PD roles to zero
+to stop capacity, and scale both back up to resume on the same URL.
+
+The OpenAI SDK retries connection failures and retryable HTTP errors before a
+stream starts. It does not resume an interrupted stream. The application must
+handle a failed or incomplete stream and decide whether to start a new request.
+Responses are stateless: pass conversation history in each request. Stored
+responses, `previous_response_id`, and background mode are unsupported.
+Inspect the terminal Responses event's status: exhausting the output budget
+returns `response.incomplete` with `incomplete_details.reason="max_output_tokens"`.
+The budget includes reasoning tokens. The OpenAI Python 2.6.1 streaming helper's
+`get_final_response()` requires `response.completed`; the typed event iterator
+above also exposes incomplete and failed responses without a custom client.
+
+`list_deployments()` returns the caller's non-deleted deployments, including
+provisioning and scaled-to-zero deployments, with desired, allocated and ready
+replica counts. Use `include_deleted=True` to include deletion tombstones.
+
+Scaling every role to zero drains the GPU workers and then stops the deployment's
+SMG and frontend pods. The endpoint identity, URL, and checkpoint are retained;
+scaling back up recreates the proxies automatically. Deleting the deployment
+removes its resources after draining.
+
+`get_deployment_usage` returns capacity events and requested GPU-hours per role.
+Requested time starts when create/scale is accepted and stops at scale-to-zero
+or delete acceptance, including provisioning and outage time; observed
+allocation/readiness is recorded separately.
+Inference requests do not generate dedicated token-billing records.
 
 ## Auto-recovery — write loops that survive failures
 
@@ -756,8 +1129,8 @@ Rules that make this correct:
 - For images, always go through the renderer (`image_part` +
   `build_training_example` / `build_sample_prompt`) or `model_input` — those
   paths validate the placeholder/image pairing client-side with a precise
-  `ValueError`. Only raw `prompt_token_ids=` + `images=` can carry a mismatch
-  to the backend (surplus images silently dropped).
+  `ValueError`. With raw `prompt_token_ids=` + `images=`, validate that
+  pairing yourself.
 
 ## Reference
 
