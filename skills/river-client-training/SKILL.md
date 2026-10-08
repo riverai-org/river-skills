@@ -608,33 +608,28 @@ ppo/cispo). `cross_entropy` returns `loss`, `loss_sum`, `loss_mean`,
 
 ## Metrics — report to River Console
 
-Requires `river-client` **0.14.0 or later**. `model.log(data)` reports scalar
-metrics — training loss and reward, evaluation results, throughput, or any
-other number — to the model's training run in River Console, using the same
-API key. There is no separate tracker, client, or run to set up.
-`model.define_metric(...)` sets chart defaults such as the x axis.
+Requires `river-client` **0.14.0 or later**. `model.log()` sends numbers from
+your training loop — loss, reward, eval accuracy, throughput, anything — to
+River Console, where they are charted on the model's training run. It uses the
+same API key; there is nothing else to set up. `model.define_metric()` picks
+each metric's x axis.
 
 ```python
 with client.session(project="grpo-math", run="lr4e-5-r16") as session:
     model = session.create_model(base_model=BASE_MODEL, lora=river.LoraConfig(rank=16))
-    model.define_metric("update", hidden=True)            # a coordinate, not a chart
+    model.define_metric("update", hidden=True)            # an axis, not a chart
     model.define_metric("train/*", step_metric="update")
-    print(f"https://console.river.ai/training/{model.training_run_id}/metrics")
 
     for update, batch in enumerate(batches, start=1):
         fb, opt = model.train_step(batch, lr=1e-4, loss_fn="cross_entropy")
         model.log({"update": update, "train/loss_mean": fb.metrics["loss_mean"]})
 ```
 
-- **One call is one complete observation.** Put every related value,
-  including its x-axis coordinate, in the same `log()` call. Nothing carries
-  over from earlier calls, `model.step` is never read, and there are no
-  `step=` / `commit=` arguments.
-- **Choose coordinates deliberately.** `model.step` advances at submission,
-  including failed ops, so it is a poor axis for pipelined or delayed work.
-  Use your loop counter, or `OptimStepResult.policy_version.step` when
-  present. Evaluations that finish after training moved on should log the
-  evaluated checkpoint's step on their own axis:
+- **Log a metric together with its x-axis value in one call.** Nothing is
+  carried over between calls and `model.step` is not used. Prefer your own
+  loop counter over `model.step`, which also advances on failed steps.
+- **Give delayed evaluations their own axis**, the step of the checkpoint
+  that was evaluated:
 
   ```python
   model.define_metric("eval_step", hidden=True)
@@ -642,37 +637,16 @@ with client.session(project="grpo-math", run="lr4e-5-r16") as session:
   model.log({"eval_step": evaluated_step, "eval/accuracy": accuracy})
   ```
 
-- **Time axes are automatic.** Every observation carries
-  `_river/timestamp` (Unix seconds at the `log()` call) and `_river/runtime`
-  (seconds since the model was created). Use either as `step_metric` without
-  logging it, e.g. `model.define_metric("perf/*", step_metric="_river/runtime")`.
-  The `_river/` prefix is reserved: never log or define names under it.
-- **`define_metric(name, *, step_metric=None, hidden=None)`** takes an exact
-  name, `"*"`, or a prefix ending in `*` (`"train/*"`). Exact names beat
-  patterns, then the longest prefix wins. Repeating a definition updates only
-  the options passed; the latest definitions apply to the whole run history
-  without changing recorded values. `hidden=True` keeps a coordinate out of
-  the automatic chart grid while still storing it. A missing configured
-  coordinate logs an SDK warning; the value is kept but cannot be plotted on
-  that axis.
-- **Values** must be finite Python or NumPy ints/floats — call `.item()` on
-  scalar tensors. Bools, strings, arrays, nested objects, NaN/inf, `None`, and
-  empty dicts raise `TypeError` / `ValueError` immediately (so
-  `opt.metrics.get("grad_norm")` must be checked before logging).
-- **Delivery is best-effort, not durable.** Observations are buffered in
-  memory and uploaded in the background (about every 2 s or when a batch
-  fills). Network and server failures never stop training; SDK warnings report
-  dropped, rejected, or unconfirmed observations. The buffer holds at most
-  10,000 values or 8 MiB, and overflow drops the oldest; a killed process loses
-  unsent data. Session exit and `client.close()` wait up to 30 s to flush —
-  there is no `finish()` call. Log from the process that created the model;
-  forked children inheriting it are ignored.
-- **Runs and projects.** Each `create_model` has its own `training_run_id`, so
-  after an auto-recovery session rebuild (below) metrics land in a new run.
-  Keep the same `project` tag and continue your coordinate from the
-  checkpoint so the runs line up in the project view; reusing a `run` name
-  does not merge runs. Project assignment is asynchronous, and changing tags
-  later does not move existing runs.
+- **Plot against time** with `step_metric="_river/runtime"` (seconds since the
+  model was created) or `"_river/timestamp"`; River adds both automatically.
+- **Values must be plain finite numbers.** Use `.item()` on tensors and skip
+  `None` (e.g. `opt.metrics.get("grad_norm")`).
+- **Compare runs** by sharing a `project` tag and giving each run a distinct
+  `run` name; Console shows them together on the project page. After an
+  auto-recovery rebuild the new model is a new run: keep the `project` tag and
+  continue your counter from the checkpoint.
+- Metrics upload in the background; network problems don't stop training.
+  Keep the normal session context so buffered metrics are flushed on exit.
 
 ## Checkpointing
 
