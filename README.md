@@ -6,7 +6,7 @@ Public [Agent Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-ski
 
 | Skill | What it covers |
 |---|---|
-| [river-client-training](skills/river-client-training/SKILL.md) | Writing training scripts with the [river-client](https://pypi.org/project/river-client/) Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Covers the current `train_step` API and its pipelining/error semantics, training data format, multimodal (image) data, sampling and logprobs, MoE expert-routing capture/replay, teacher→student distillation, and fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors. |
+| [river-client-training](skills/river-client-training/SKILL.md) | Writing training scripts with the [river-client](https://pypi.org/project/river-client/) Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Covers the current `train_step` API and its pipelining/error semantics, training data format, multimodal (image) data, reporting metrics to River Console charts, sampling and logprobs, MoE expert-routing capture/replay, teacher→student distillation, and fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors. |
 
 ## Install
 
