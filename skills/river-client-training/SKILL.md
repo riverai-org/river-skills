@@ -1,6 +1,6 @@
 ---
 name: river-client-training
-description: Write training scripts with the river-client Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Use when writing or reviewing code that imports river_client, builds training data for forward_backward / train_step, samples from training weights, or wires up a training loop. Centers on the current train_step API and its pipelining/error semantics; also covers multimodal (image) data, session tags, sampling and prompt logprobs and their uses, MoE expert-routing capture and replay, teacher→student distillation with two models, and fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors.
+description: Write training scripts with the river-client Python package — LoRA fine-tuning, SFT, and RL/GRPO on River-hosted models via the River training API. Use when writing or reviewing code that imports river_client, builds training data for forward_backward / train_step, samples from training weights, or wires up a training loop. Centers on the current train_step API and its pipelining/error semantics; also covers multimodal (image) data, session tags, reporting metrics to River Console charts with model.log / model.define_metric, sampling and prompt logprobs and their uses, MoE expert-routing capture and replay, teacher→student distillation with two models, and fault-tolerant loops that auto-recover from session loss, capacity, and timeout errors.
 ---
 
 # Train with river_client (the current API)
@@ -41,17 +41,18 @@ Any keyword arguments to `client.session(...)` become **session tags** —
 arbitrary string key→value metadata stamped on the session:
 
 ```python
-with client.session(experiment="grpo-math", run="lr4e-5-r16") as session:
+with client.session(project="grpo-math", run="lr4e-5-r16") as session:
     ...
 ```
 
-Tags don't change behavior; they exist so runs can be found later: the River
-Console can filter training runs by tag, and tags travel with the run for
-correlating against an external experiment tracker (a common convention is
-`client.session(wandb_project=..., wandb_name=...)`). Tag long-running
-experiments — an untagged session is hard to tell apart from every other one
-once you have dozens. Key/value counts and lengths are bounded server-side,
-so keep them short labels, not payloads.
+Tags don't change training behavior; they exist so runs can be found later.
+The River Console filters training runs by tag, and two tags have Console
+meaning: `project` places new training runs in the named Console project
+(created if needed) so their [metrics](#metrics--report-to-river-console) can
+be compared, and `run` is the readable name shown in Console and chart legends.
+Tag long-running experiments — an untagged session is hard to tell apart from
+every other one once you have dozens. Key/value counts and lengths are bounded
+server-side, so keep them short labels, not payloads.
 
 `LoraConfig` knobs: `rank` (max 32), `train_attn` / `train_mlp` (both default
 on), `train_unembed` (default off), `seed` (reproducible adapter init).
@@ -605,6 +606,48 @@ RL metrics come back on `ForwardResult.metrics`: raw sums plus derived
 ppo/cispo). `cross_entropy` returns `loss`, `loss_sum`, `loss_mean`,
 `num_tokens`, `weight_sum`.
 
+## Metrics — report to River Console
+
+Requires `river-client` **0.14.0 or later**. `model.log()` sends numbers from
+your training loop — loss, reward, eval accuracy, throughput, anything — to
+River Console, where they are charted on the model's training run. It uses the
+same API key; there is nothing else to set up. `model.define_metric()` picks
+each metric's x axis.
+
+```python
+with client.session(project="grpo-math", run="lr4e-5-r16") as session:
+    model = session.create_model(base_model=BASE_MODEL, lora=river.LoraConfig(rank=16))
+    model.define_metric("update", hidden=True)            # an axis, not a chart
+    model.define_metric("train/*", step_metric="update")
+
+    for update, batch in enumerate(batches, start=1):
+        fb, opt = model.train_step(batch, lr=1e-4, loss_fn="cross_entropy")
+        model.log({"update": update, "train/loss_mean": fb.metrics["loss_mean"]})
+```
+
+- **Log a metric together with its x-axis value in one call.** Nothing is
+  carried over between calls and `model.step` is not used. Prefer your own
+  loop counter over `model.step`, which also advances on failed steps.
+- **Give delayed evaluations their own axis**, the step of the checkpoint
+  that was evaluated:
+
+  ```python
+  model.define_metric("eval_step", hidden=True)
+  model.define_metric("eval/*", step_metric="eval_step")
+  model.log({"eval_step": evaluated_step, "eval/accuracy": accuracy})
+  ```
+
+- **Plot against time** with `step_metric="_river/runtime"` (seconds since the
+  model was created) or `"_river/timestamp"`; River adds both automatically.
+- **Values must be plain finite numbers.** Use `.item()` on tensors and skip
+  `None` (e.g. `opt.metrics.get("grad_norm")`).
+- **Compare runs** by sharing a `project` tag and giving each run a distinct
+  `run` name; Console shows them together on the project page. After an
+  auto-recovery rebuild the new model is a new run: keep the `project` tag and
+  continue your counter from the checkpoint.
+- Metrics upload in the background; network problems don't stop training.
+  Keep the normal session context so buffered metrics are flushed on exit.
+
 ## Checkpointing
 
 ```python
@@ -748,6 +791,9 @@ Rules that make this correct:
   return per-token logprobs when the worker includes them.
 - There is no packaged helper for building the RL datum — build the dict by
   hand as in Example 2.
+- **Metrics:** log each value together with its coordinate in one
+  `model.log()` call; don't rely on `model.step` or on an earlier call
+  supplying the axis. Never log `None` or non-finite values.
 - Sessions are not durable — checkpoints are. A long run without the
   auto-recovery skeleton will eventually lose work to a transient failure.
 - Never recompute `old_logprobs` client-side — use `Sample.logprobs`
